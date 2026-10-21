@@ -13,3 +13,8 @@ url = "https://github.com/DreamWeave-MP"
 [package]
 format = "jpk"
 jess = "org.dreamweave.truetype"
+
+[[releases]]
+version = "0.1.0"
+date = 2026-10-21
+summary = "First release: TrueType fonts read in JSL, names, metrics, character maps, kerning and outlines handed to a pen."
