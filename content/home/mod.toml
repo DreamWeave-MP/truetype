@@ -1,0 +1,15 @@
+# truetype as a DreamWeave project: a Jess package. `jess` names the Package Source it publishes,
+# the repository root's own jess.toml, and each release tag `truetype-<version>` is one version of
+# the package, packed by the Mod Template from that tag; every push packs a development build.
+id = "4a074668-4523-4c12-871c-4411c245bcca"
+slug = "truetype"
+type = "library"
+status = "active"
+
+[[maintainers]]
+name = "DreamWeave"
+url = "https://github.com/DreamWeave-MP"
+
+[package]
+format = "jpk"
+jess = "org.dreamweave.truetype"
