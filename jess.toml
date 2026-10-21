@@ -1,0 +1,19 @@
+manifest_version = 1
+
+[package]
+id = "org.dreamweave.truetype"
+version = "0.1.0"
+jess_api = "1"
+include = ["src", "tests", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+tests = ["tests/font.jsl", "tests/style.jsl"]
+
+[modules]
+"@truetype" = "src/init.jsl"
+
+# The module is inert API. `load` reads a font file when it is given a path rather than bytes,
+# so its caller needs filesystem.read for that, and for nothing else.
+
+[[layer]]
+id = "truetype.core"
+requires = []
+exports = ["@truetype"]

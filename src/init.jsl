@@ -1,0 +1,906 @@
+--!strict
+--[[
+@truetype: TrueType fonts, read in JSL: names, metrics, character maps, kerning, and outlines.
+
+  truetype.load(source) -> Font        a .ttf or .otf with TrueType outlines, as bytes or a path
+  Font:glyph(codepoint) -> number      the glyph a character maps to, 0 when the font lacks it
+  Font:missing(text) -> { string }     the characters of a text the font has no glyph for
+  Font:measure(text, size, options)    the advance and ink box of a run of text
+  Font:outline(pen, text, size, x, y, options) -> Metrics
+
+Sizes are pixels per em; a run starts at its origin on the baseline and runs right, y down. Text
+is UTF-8, one glyph a character, kerned by the font's GPOS pair adjustments (the `kern` feature
+of its Latin or default script) or else by a `kern` table. There is no hinting, no glyph
+substitution (no ligatures, no shaping of complex scripts), and no CFF outlines.
+
+Outlines go to a pen, a table of four functions, so the package draws with nothing of its own:
+whatever fills shapes (a rasterizer, an SVG writer, a hit test) hands it one.
+]]
+local bytes = require '@dream/bytes'
+local fs = require '@dream/fs'
+
+local Font = {}
+Font.__index = Font
+
+--- A glyph's outline in font units, y up: each contour's points as x, y, and 1 when the point is
+--- on the curve or 0 when it is a control point, in one flat list.
+type Outline = { contours: { { number } }, left: number, bottom: number, right: number, top: number }
+
+--- A GPOS pair adjustment subtable, as offsets into the font.
+type PairTable = { at: number, format: number, coverage: number, firstFormat: number, secondFormat: number }
+
+type Fields = {
+  data: buffer,
+  --- Each table's offset, by tag.
+  tables: { [string]: number },
+  glyphCount: number,
+  unitsPerEm: number,
+  ascender: number,
+  descender: number,
+  lineGap: number,
+  capHeight: number,
+  xHeight: number,
+  family: string,
+  subfamily: string,
+  fullName: string,
+  version: string,
+  longOffsets: boolean,
+  metricCount: number,
+  --- The cmap subtable characters are looked up in, and its format.
+  mapAt: number,
+  mapFormat: number,
+  --- The GPOS kerning lookups' pair subtables, a list for each lookup in order.
+  pairLookups: { { PairTable } },
+  --- A `kern` table's pairs, by first glyph * 65536 + second, when the font has no GPOS kerning.
+  kernPairs: { [number]: number },
+  glyphs: { [number]: number },
+  outlines: { [number]: Outline },
+  kerns: { [number]: number },
+}
+
+--- A TrueType font: its names and vertical metrics in font units, and what it is read from.
+export type Font = typeof(setmetatable({} :: Fields, Font))
+
+--- What outlines are drawn with, in pixels, y down: each contour moves to its start, runs through
+--- lines and quadratic curves (a control point, then the point the curve ends on), and closes back
+--- to its start.
+export type Pen = {
+  moveTo: (x: number, y: number) -> (),
+  lineTo: (x: number, y: number) -> (),
+  quadTo: (controlX: number, controlY: number, x: number, y: number) -> (),
+  close: () -> (),
+}
+
+--- How a run of text is set: pixels added between each glyph and the next, and whether the
+--- font's kerning applies, which it does unless this says `false`.
+export type Options = { tracking: number?, kerning: boolean? }
+
+--- A run of text at a size, in pixels: `width` is how far its origin moves, and the ink box
+--- (`left`, `top`, `right`, `bottom`) is where its glyphs' outlines can reach, about its origin on
+--- the baseline with y down, all zeros when it has no ink. `ascent`, `descent`, `capHeight` and
+--- `xHeight` are the font's at that size, `descent` below the baseline and positive.
+export type Metrics = {
+  width: number,
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+  ascent: number,
+  descent: number,
+  capHeight: number,
+  xHeight: number,
+}
+
+local Module = {}
+
+local function u16(data: buffer, at: number): number
+  return bytes.readu16be(data, at)
+end
+
+local function i16(data: buffer, at: number): number
+  return bytes.readi16be(data, at)
+end
+
+local function u32(data: buffer, at: number): number
+  return bytes.readu32be(data, at)
+end
+
+--- A 2.14 fixed-point number.
+local function f2dot14(data: buffer, at: number): number
+  return i16(data, at) / 16384
+end
+
+--- The offset of a table a font must have, or an error naming it.
+local function needed(tables: { [string]: number }, tag: string): number
+  local at = tables[tag]
+  if not at then error(`truetype: font has no '{tag}' table`, 3) end
+
+  return at
+end
+
+--- A `name` table string as text: UTF-16 for Windows and Unicode platforms, bytes for Mac. A
+--- character past ASCII becomes `?`; these are for records and messages, not for setting.
+local function nameText(data: buffer, at: number, length: number, platform: number): string
+  if platform == 1 then return buffer.readstring(data, at, length) end
+
+  local characters = table.create(length // 2) :: { string }
+
+  for offset = at, at + length - 2, 2 do
+    local code = u16(data, offset)
+
+    table.insert(characters, if code < 128 then string.char(code) else '?')
+  end
+
+  return table.concat(characters)
+end
+
+--- The font's names, by name ID, Windows English first and anything else after.
+local function names(data: buffer, at: number?): { [number]: string }
+  local found: { [number]: string } = {}
+
+  if not at then return found end
+
+  local count, strings = u16(data, at + 2), at + u16(data, at + 4)
+  local ranks: { [number]: number } = {}
+
+  for index = 0, count - 1 do
+    local record = at + 6 + index * 12
+    local platform, language, id = u16(data, record), u16(data, record + 4), u16(data, record + 6)
+    local rank = if platform == 3 and language == 0x409 then 3 elseif platform == 3 or platform == 0 then 2 else 1
+
+    if (ranks[id] or 0) >= rank then continue end
+
+    ranks[id] = rank
+    found[id] = nameText(data, strings + u16(data, record + 10), u16(data, record + 8), platform)
+  end
+
+  return found
+end
+
+--- The cmap subtable to look characters up in, and its format: a full Unicode one (format 12)
+--- before a basic one (format 4).
+local function characterMap(data: buffer, at: number): (number, number)
+  local best, bestFormat, bestRank = 0, 0, 0
+
+  for index = 0, u16(data, at + 2) - 1 do
+    local record = at + 4 + index * 8
+    local platform, encoding = u16(data, record), u16(data, record + 2)
+    local subtable = at + u32(data, record + 4)
+    local format = u16(data, subtable)
+    local unicode = platform == 0 or (platform == 3 and (encoding == 1 or encoding == 10))
+    local rank = if not unicode then 0 elseif format == 12 then 2 elseif format == 4 then 1 else 0
+
+    if rank <= bestRank then continue end
+
+    best, bestFormat, bestRank = subtable, format, rank
+  end
+
+  if bestRank == 0 then error('truetype: font has no Unicode cmap of format 4 or 12', 3) end
+
+  return best, bestFormat
+end
+
+--- Where a glyph is in a coverage table, or nothing when it isn't covered.
+local function covered(data: buffer, at: number, glyph: number): number?
+  local format = u16(data, at)
+  local low, high = 0, u16(data, at + 2) - 1
+
+  if format == 1 then
+    while low <= high do
+      local middle = (low + high) // 2
+      local candidate = u16(data, at + 4 + middle * 2)
+
+      if candidate == glyph then return middle end
+
+      if candidate < glyph then
+        low = middle + 1
+      else
+        high = middle - 1
+      end
+    end
+
+    return nil
+  end
+
+  while low <= high do
+    local middle = (low + high) // 2
+    local range = at + 4 + middle * 6
+
+    if glyph < u16(data, range) then
+      high = middle - 1
+    elseif glyph > u16(data, range + 2) then
+      low = middle + 1
+    else
+      return u16(data, range + 4) + glyph - u16(data, range)
+    end
+  end
+
+  return nil
+end
+
+--- The class a class definition table gives a glyph, 0 when it names none.
+local function classOf(data: buffer, at: number, glyph: number): number
+  if u16(data, at) == 1 then
+    local index = glyph - u16(data, at + 2)
+
+    if index < 0 or index >= u16(data, at + 4) then return 0 end
+
+    return u16(data, at + 6 + index * 2)
+  end
+
+  local low, high = 0, u16(data, at + 2) - 1
+
+  while low <= high do
+    local middle = (low + high) // 2
+    local range = at + 4 + middle * 6
+
+    if glyph < u16(data, range) then
+      high = middle - 1
+    elseif glyph > u16(data, range + 2) then
+      low = middle + 1
+    else
+      return u16(data, range + 4)
+    end
+  end
+
+  return 0
+end
+
+--- How many bytes a GPOS value record of a format takes: two for each field it has.
+local function valueSize(format: number): number
+  local size = 0
+
+  for bit = 0, 7 do
+    if bit32.btest(format, bit32.lshift(1, bit)) then size += 2 end
+  end
+
+  return size
+end
+
+--- The x advance adjustment a value record of a format holds, or 0.
+local function advanceOf(data: buffer, at: number, format: number): number
+  if not bit32.btest(format, 4) then return 0 end
+
+  -- X placement and Y placement come before it, each when the format has it.
+  local skip = (if bit32.btest(format, 1) then 2 else 0) + (if bit32.btest(format, 2) then 2 else 0)
+
+  return i16(data, at + skip)
+end
+
+--- The pair subtables of each lookup the `kern` feature of the Latin script (or else the default
+--- one) uses, in lookup order.
+local function pairLookups(data: buffer, at: number?): { { PairTable } }
+  local lookups: { { PairTable } } = {}
+
+  if not at then return lookups end
+
+  local scripts, features, lookupList = at + u16(data, at + 4), at + u16(data, at + 6), at + u16(data, at + 8)
+  local system: number? = nil
+
+  for index = 0, u16(data, scripts) - 1 do
+    local record = scripts + 2 + index * 6
+    local tag = buffer.readstring(data, record, 4)
+    local script = scripts + u16(data, record + 4)
+    local defaultSystem = u16(data, script)
+
+    if defaultSystem == 0 then continue end
+    if tag == 'latn' or (tag == 'DFLT' and not system) then system = script + defaultSystem end
+  end
+
+  if not system then return lookups end
+
+  local chosen: { number } = {}
+
+  for index = 0, u16(data, system + 4) - 1 do
+    local feature = u16(data, system + 6 + index * 2)
+    local record = features + 2 + feature * 6
+
+    if buffer.readstring(data, record, 4) ~= 'kern' then continue end
+
+    local featureTable = features + u16(data, record + 4)
+
+    for lookup = 0, u16(data, featureTable + 2) - 1 do
+      local lookupIndex = u16(data, featureTable + 4 + lookup * 2)
+
+      if not table.find(chosen, lookupIndex) then table.insert(chosen, lookupIndex) end
+    end
+  end
+
+  table.sort(chosen)
+
+  for _, lookupIndex in chosen do
+    local lookup = lookupList + u16(data, lookupList + 2 + lookupIndex * 2)
+    local kind = u16(data, lookup)
+    local subtables: { PairTable } = {}
+
+    for index = 0, u16(data, lookup + 4) - 1 do
+      local subtable = lookup + u16(data, lookup + 6 + index * 2)
+      local subtableKind = kind
+
+      -- An extension subtable holds the real one's kind and a 32-bit offset to it.
+      if kind == 9 then
+        subtableKind = u16(data, subtable + 2)
+        subtable += u32(data, subtable + 4)
+      end
+
+      if subtableKind ~= 2 then continue end
+
+      table.insert(subtables, {
+        at = subtable,
+        format = u16(data, subtable),
+        coverage = subtable + u16(data, subtable + 2),
+        firstFormat = u16(data, subtable + 4),
+        secondFormat = u16(data, subtable + 6),
+      })
+    end
+
+    if #subtables > 0 then table.insert(lookups, subtables) end
+  end
+
+  return lookups
+end
+
+--- A `kern` table's horizontal pairs (format 0 subtables), by first glyph * 65536 + second.
+local function kernTable(data: buffer, at: number?): { [number]: number }
+  local pairs: { [number]: number } = {}
+
+  if not at or u16(data, at) ~= 0 then return pairs end
+
+  local subtable = at + 4
+
+  for _ = 1, u16(data, at + 2) do
+    local length, coverage = u16(data, subtable + 2), u16(data, subtable + 4)
+
+    -- Format 0 (the high byte), horizontal, not cross-stream, not minimum values.
+    if bit32.rshift(coverage, 8) == 0 and bit32.band(coverage, 0x7) == 1 then
+      for index = 0, u16(data, subtable + 6) - 1 do
+        local pair = subtable + 14 + index * 6
+
+        pairs[u16(data, pair) * 65536 + u16(data, pair + 2)] = i16(data, pair + 4)
+      end
+    end
+
+    subtable += length
+  end
+
+  return pairs
+end
+
+--- Reads a font from its bytes or from the file at a path.
+function Module.load(source: buffer | string): Font
+  local data: buffer
+
+  if type(source) == 'string' then
+    local read, problem = fs.readFile(source)
+    if not read then error(`truetype: can't read font {source}: {problem}`, 2) end
+
+    data = read
+  else
+    data = source
+  end
+
+  if buffer.len(data) < 12 then error('truetype: not a font: too short', 2) end
+
+  local signature = u32(data, 0)
+
+  if signature ~= 0x00010000 and signature ~= 0x74727565 then
+    error('truetype: not a TrueType font (a collection, CFF outlines, WOFF and WOFF2 are not read)', 2)
+  end
+
+  local tables: { [string]: number } = {}
+
+  for index = 0, u16(data, 4) - 1 do
+    local record = 12 + index * 16
+
+    tables[buffer.readstring(data, record, 4)] = u32(data, record + 8)
+  end
+
+  local head, horizontal, profile = needed(tables, 'head'), needed(tables, 'hhea'), needed(tables, 'maxp')
+
+  needed(tables, 'hmtx')
+  needed(tables, 'loca')
+  needed(tables, 'glyf')
+
+  local mapAt, mapFormat = characterMap(data, needed(tables, 'cmap'))
+  local unitsPerEm = u16(data, head + 18)
+  local ascender, descender = i16(data, horizontal + 4), i16(data, horizontal + 6)
+  local found = names(data, tables.name)
+  local metrics = tables['OS/2']
+  -- OS/2 version 2 and later say how tall capitals and lower case are; without it they are
+  -- guessed as shares of the ascender.
+  local hasHeights = metrics and u16(data, metrics) >= 2
+  local capHeight = if metrics and hasHeights then i16(data, metrics + 88) else math.floor(ascender * 0.7)
+  local xHeight = if metrics and hasHeights then i16(data, metrics + 86) else math.floor(ascender * 0.5)
+  local fields: Fields = {
+    data = data,
+    tables = tables,
+    glyphCount = u16(data, profile + 4),
+    unitsPerEm = unitsPerEm,
+    ascender = ascender,
+    descender = descender,
+    lineGap = i16(data, horizontal + 8),
+    capHeight = capHeight,
+    xHeight = xHeight,
+    family = found[16] or found[1] or '',
+    subfamily = found[17] or found[2] or '',
+    fullName = found[4] or '',
+    version = found[5] or '',
+    longOffsets = i16(data, head + 50) == 1,
+    metricCount = u16(data, horizontal + 34),
+    mapAt = mapAt,
+    mapFormat = mapFormat,
+    pairLookups = pairLookups(data, tables.GPOS),
+    kernPairs = {},
+    glyphs = {},
+    outlines = {},
+    kerns = {},
+  }
+
+  if #fields.pairLookups == 0 then fields.kernPairs = kernTable(data, tables.kern) end
+
+  return setmetatable(fields, Font)
+end
+
+--- The glyph a format 4 subtable maps a character to.
+local function segmentGlyph(data: buffer, at: number, codepoint: number): number
+  if codepoint > 0xffff then return 0 end
+
+  local segments = u16(data, at + 6) // 2
+  local ends, starts = at + 14, at + 16 + segments * 2
+  local deltas, ranges = starts + segments * 2, starts + segments * 4
+  local low, high = 0, segments - 1
+
+  while low <= high do
+    local middle = (low + high) // 2
+
+    if codepoint > u16(data, ends + middle * 2) then
+      low = middle + 1
+      continue
+    end
+
+    if codepoint < u16(data, starts + middle * 2) then
+      high = middle - 1
+      continue
+    end
+
+    local delta, range = u16(data, deltas + middle * 2), u16(data, ranges + middle * 2)
+
+    if range == 0 then return (codepoint + delta) % 65536 end
+
+    local glyph = u16(data, ranges + middle * 2 + range + (codepoint - u16(data, starts + middle * 2)) * 2)
+
+    return if glyph == 0 then 0 else (glyph + delta) % 65536
+  end
+
+  return 0
+end
+
+--- The glyph a format 12 subtable maps a character to.
+local function groupGlyph(data: buffer, at: number, codepoint: number): number
+  local low, high = 0, u32(data, at + 12) - 1
+
+  while low <= high do
+    local middle = (low + high) // 2
+    local group = at + 16 + middle * 12
+
+    if codepoint < u32(data, group) then
+      high = middle - 1
+    elseif codepoint > u32(data, group + 4) then
+      low = middle + 1
+    else
+      return u32(data, group + 8) + codepoint - u32(data, group)
+    end
+  end
+
+  return 0
+end
+
+--- The glyph the font maps a character to, by its code point: 0, the missing glyph, when it has
+--- none.
+function Font.glyph(self: Font, codepoint: number): number
+  local known = self.glyphs[codepoint]
+
+  if known then return known end
+
+  local glyph = if self.mapFormat == 12
+    then groupGlyph(self.data, self.mapAt, codepoint)
+    else segmentGlyph(self.data, self.mapAt, codepoint)
+
+  self.glyphs[codepoint] = glyph
+
+  return glyph
+end
+
+--- The characters of a text the font has no glyph for, each once, in the order they come.
+function Font.missing(self: Font, text: string): { string }
+  local lacking: { string } = {}
+
+  for _, codepoint in utf8.codes(text) do
+    local character = utf8.char(codepoint)
+
+    if self:glyph(codepoint) == 0 and not table.find(lacking, character) then table.insert(lacking, character) end
+  end
+
+  return lacking
+end
+
+--- How far a glyph moves the pen, in font units.
+function Font.advance(self: Font, glyph: number): number
+  local metrics = self.tables.hmtx
+  local index = math.min(glyph, self.metricCount - 1)
+
+  return u16(self.data, metrics + index * 4)
+end
+
+--- The adjustment to the space between two glyphs, in font units.
+function Font.kerning(self: Font, first: number, second: number): number
+  local key = first * 65536 + second
+  local known = self.kerns[key]
+
+  if known then return known end
+
+  local data = self.data
+  local total = self.kernPairs[key] or 0
+
+  for _, subtables in self.pairLookups do
+    for _, pairTable in subtables do
+      local coverageIndex = covered(data, pairTable.coverage, first)
+
+      if not coverageIndex then continue end
+
+      local firstSize, secondSize = valueSize(pairTable.firstFormat), valueSize(pairTable.secondFormat)
+      local applied = false
+
+      if pairTable.format == 1 then
+        local set = pairTable.at + u16(data, pairTable.at + 10 + coverageIndex * 2)
+        local recordSize = 2 + firstSize + secondSize
+        local low, high = 0, u16(data, set) - 1
+
+        while low <= high do
+          local middle = (low + high) // 2
+          local record = set + 2 + middle * recordSize
+          local candidate = u16(data, record)
+
+          if candidate == second then
+            total += advanceOf(data, record + 2, pairTable.firstFormat)
+            applied = true
+
+            break
+          end
+
+          if candidate < second then
+            low = middle + 1
+          else
+            high = middle - 1
+          end
+        end
+      elseif pairTable.format == 2 then
+        local at = pairTable.at
+        local firstClass = classOf(data, at + u16(data, at + 8), first)
+        local secondClass = classOf(data, at + u16(data, at + 10), second)
+        local secondCount = u16(data, at + 14)
+        local record = at + 16 + (firstClass * secondCount + secondClass) * (firstSize + secondSize)
+
+        total += advanceOf(data, record, pairTable.firstFormat)
+        applied = true
+      end
+
+      -- A lookup applies its first subtable that takes the pair.
+      if applied then break end
+    end
+  end
+
+  self.kerns[key] = total
+
+  return total
+end
+
+--- Appends a composite glyph's components to an outline, each moved by its transform.
+local function components(self: Font, at: number, outline: Outline, depth: number)
+  local data = self.data
+  local more = true
+
+  while more do
+    local flags, component = u16(data, at), u16(data, at + 2)
+    local dx, dy = 0, 0
+
+    at += 4
+
+    -- Arguments are words or bytes, and offsets or (unsupported here) points to match.
+    if bit32.btest(flags, 0x1) then
+      if bit32.btest(flags, 0x2) then dx, dy = i16(data, at), i16(data, at + 2) end
+
+      at += 4
+    else
+      if bit32.btest(flags, 0x2) then dx, dy = buffer.readi8(data, at), buffer.readi8(data, at + 1) end
+
+      at += 2
+    end
+
+    local xx, xy, yx, yy = 1, 0, 0, 1
+
+    if bit32.btest(flags, 0x8) then
+      xx = f2dot14(data, at)
+      yy = xx
+      at += 2
+    elseif bit32.btest(flags, 0x40) then
+      xx, yy = f2dot14(data, at), f2dot14(data, at + 2)
+      at += 4
+    elseif bit32.btest(flags, 0x80) then
+      xx, xy, yx, yy = f2dot14(data, at), f2dot14(data, at + 2), f2dot14(data, at + 4), f2dot14(data, at + 6)
+      at += 8
+    end
+
+    for _, contour in self:outlineOf(component, depth + 1).contours do
+      local moved = table.create(#contour) :: { number }
+
+      for index = 1, #contour - 2, 3 do
+        local pointX, pointY = contour[index], contour[index + 1]
+
+        table.insert(moved, xx * pointX + yx * pointY + dx)
+        table.insert(moved, xy * pointX + yy * pointY + dy)
+        table.insert(moved, contour[index + 2])
+      end
+
+      table.insert(outline.contours, moved)
+    end
+
+    more = bit32.btest(flags, 0x20)
+  end
+end
+
+--- A simple glyph's contours, from its description at `at` (past its header).
+local function contoursOf(data: buffer, at: number, count: number): { { number } }
+  local ends = table.create(count) :: { number }
+
+  for index = 0, count - 1 do
+    table.insert(ends, u16(data, at + index * 2))
+  end
+
+  local points = ends[count] + 1
+  local cursor = at + count * 2
+  local flags = table.create(points) :: { number }
+
+  cursor += 2 + u16(data, cursor)
+
+  while #flags < points do
+    local flag = buffer.readu8(data, cursor)
+
+    cursor += 1
+    table.insert(flags, flag)
+
+    if bit32.btest(flag, 0x8) then
+      for _ = 1, buffer.readu8(data, cursor) do
+        table.insert(flags, flag)
+      end
+
+      cursor += 1
+    end
+  end
+
+  local xs, ys = table.create(points) :: { number }, table.create(points) :: { number }
+  local pointX, pointY = 0, 0
+
+  for index = 1, points do
+    local flag = flags[index]
+
+    if bit32.btest(flag, 0x2) then
+      local step = buffer.readu8(data, cursor)
+
+      pointX += if bit32.btest(flag, 0x10) then step else -step
+      cursor += 1
+    elseif not bit32.btest(flag, 0x10) then
+      pointX += i16(data, cursor)
+      cursor += 2
+    end
+
+    xs[index] = pointX
+  end
+
+  for index = 1, points do
+    local flag = flags[index]
+
+    if bit32.btest(flag, 0x4) then
+      local step = buffer.readu8(data, cursor)
+
+      pointY += if bit32.btest(flag, 0x20) then step else -step
+      cursor += 1
+    elseif not bit32.btest(flag, 0x20) then
+      pointY += i16(data, cursor)
+      cursor += 2
+    end
+
+    ys[index] = pointY
+  end
+
+  local contours = table.create(count) :: { { number } }
+  local first = 1
+
+  for _, last in ends do
+    local contour = table.create((last + 2 - first) * 3) :: { number }
+
+    for index = first, last + 1 do
+      table.insert(contour, xs[index])
+      table.insert(contour, ys[index])
+      table.insert(contour, if bit32.btest(flags[index], 0x1) then 1 else 0)
+    end
+
+    table.insert(contours, contour)
+    first = last + 2
+  end
+
+  return contours
+end
+
+--- A glyph's outline in font units, read once and kept.
+function Font.outlineOf(self: Font, glyph: number, depth: number?): Outline
+  local known = self.outlines[glyph]
+
+  if known then return known end
+  if (depth or 0) > 8 then error('truetype: font has composite glyphs nested past eight deep', 2) end
+
+  local data, tables = self.data, self.tables
+  local locations, glyphs = tables.loca, tables.glyf
+  local start, finish = 0, 0
+
+  -- A glyph past the font's count has no outline, and no place in `loca` to look for one.
+  if glyph < self.glyphCount and self.longOffsets then
+    start, finish = u32(data, locations + glyph * 4), (u32(data, locations + glyph * 4 + 4))
+  elseif glyph < self.glyphCount then
+    start, finish = u16(data, locations + glyph * 2) * 2, (u16(data, locations + glyph * 2 + 2) * 2)
+  end
+
+  local outline: Outline = { contours = {}, left = 0, bottom = 0, right = 0, top = 0 }
+
+  if finish > start then
+    local at = glyphs + start
+    local count = i16(data, at)
+
+    outline.left, outline.bottom, outline.right, outline.top = i16(data, at + 2), i16(data, at + 4), i16(data, at + 6), i16(data, at + 8)
+
+    if count > 0 then
+      outline.contours = contoursOf(data, at + 10, count)
+    elseif count < 0 then
+      components(self, at + 10, outline, depth or 0)
+    end
+  end
+
+  self.outlines[glyph] = outline
+
+  return outline
+end
+
+--- Each glyph of a run and where its origin falls, in font units from the run's origin, and how
+--- far the run moves the pen, also in font units.
+local function placed(self: Font, text: string, size: number, options: Options?): ({ number }, { number }, number)
+  local tracking = (if options then options.tracking else nil) or 0
+  local kerned = not options or options.kerning ~= false
+  -- Tracking is in pixels, the rest in font units.
+  local spacing = tracking * self.unitsPerEm / size
+  local glyphs, offsets: { number } = {}, {}
+  local pen, previous = 0, -1
+
+  for _, codepoint in utf8.codes(text) do
+    local glyph = self:glyph(codepoint)
+
+    if previous >= 0 then
+      pen += spacing
+      if kerned then pen += self:kerning(previous, glyph) end
+    end
+
+    table.insert(glyphs, glyph)
+    table.insert(offsets, pen)
+    pen += self:advance(glyph)
+    previous = glyph
+  end
+
+  return glyphs, offsets, pen
+end
+
+--- The advance and ink box of a run of text at a size.
+function Font.measure(self: Font, text: string, size: number, options: Options?): Metrics
+  local scale = size / self.unitsPerEm
+  local glyphs, offsets, advance = placed(self, text, size, options)
+  local left, top, right, bottom = math.huge, math.huge, -math.huge, -math.huge
+
+  for index, glyph in glyphs do
+    local outline = self:outlineOf(glyph)
+
+    if #outline.contours == 0 then continue end
+
+    left, right = math.min(left, offsets[index] + outline.left), (math.max(right, offsets[index] + outline.right))
+    top, bottom = math.min(top, -outline.top), (math.max(bottom, -outline.bottom))
+  end
+
+  if left > right then left, top, right, bottom = 0, 0, 0, 0 end
+
+  return {
+    width = advance * scale,
+    left = left * scale,
+    top = top * scale,
+    right = right * scale,
+    bottom = bottom * scale,
+    ascent = self.ascender * scale,
+    descent = -self.descender * scale,
+    capHeight = self.capHeight * scale,
+    xHeight = self.xHeight * scale,
+  }
+end
+
+--- Hands a glyph contour, in font units, to a pen, scaled and placed with its origin at a point.
+local function trace(pen: Pen, contour: { number }, scale: number, originX: number, originY: number)
+  local count = #contour // 3
+
+  if count < 2 then return end
+
+  local xs, ys = table.create(count) :: { number }, table.create(count) :: { number }
+  local first = 0
+
+  for index = 1, count do
+    xs[index] = originX + contour[index * 3 - 2] * scale
+    ys[index] = originY - contour[index * 3 - 1] * scale
+
+    if first == 0 and contour[index * 3] == 1 then first = index end
+  end
+
+  -- A contour starts on its first point on the curve, or, when every point is a control point,
+  -- on the point implied halfway between the last and the first.
+  local startX, startY, from
+
+  if first > 0 then
+    startX, startY, from = xs[first], ys[first], first
+  else
+    startX, startY, from = (xs[count] + xs[1]) / 2, (ys[count] + ys[1]) / 2, 0
+  end
+
+  pen.moveTo(startX, startY)
+
+  -- Between two control points in a row lies an implied point on the curve.
+  local controlX: number?, controlY = nil, 0
+  local visits = if first > 0 then count - 1 else count
+
+  for step = 1, visits do
+    local index = (from + step - 1) % count + 1
+    local pointX, pointY = xs[index], ys[index]
+
+    if contour[index * 3] == 1 then
+      if controlX then
+        pen.quadTo(controlX, controlY, pointX, pointY)
+        controlX = nil
+      else
+        pen.lineTo(pointX, pointY)
+      end
+
+      continue
+    end
+
+    if controlX then pen.quadTo(controlX, controlY, (controlX + pointX) / 2, (controlY + pointY) / 2) end
+
+    controlX, controlY = pointX, pointY
+  end
+
+  if controlX then pen.quadTo(controlX, controlY, startX, startY) end
+
+  pen.close()
+end
+
+--- Hands a run of text's outlines to a pen, its origin on the baseline at a point, and returns
+--- the run's metrics.
+function Font.outline(self: Font, pen: Pen, text: string, size: number, originX: number, originY: number, options: Options?): Metrics
+  local scale = size / self.unitsPerEm
+  local glyphs, offsets = placed(self, text, size, options)
+
+  for index, glyph in glyphs do
+    local glyphX = originX + offsets[index] * scale
+
+    for _, contour in self:outlineOf(glyph).contours do
+      trace(pen, contour, scale, glyphX, originY)
+    end
+  end
+
+  return self:measure(text, size, options)
+end
+
+Module.Font = Font
+
+return Module

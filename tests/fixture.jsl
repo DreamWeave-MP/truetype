@@ -1,0 +1,220 @@
+--!strict
+--[[
+Small TrueType fonts built byte by byte, so the suite reads fonts whose every number it knows.
+
+Each has 1000 units to the em, an ascender of 800, a descender of -200 and a line gap of 100, and
+four glyphs: the missing glyph, empty; `A`, a square from (100, 0) to (500, 700) on the curve,
+600 wide; `B`, a diamond through (300, 0), (600, 350), (300, 700) and (0, 350), every point a
+control point, 600 wide; and `C`, a composite of `A` at half size moved 50 right, 400 wide.
+
+`kerned` kerns through GPOS: A then B by -50 in a pair set (format 1) behind an extension
+lookup, and B then A by -20 through classes (format 2). `legacy` has no GPOS and kerns A then C by
+-30 in a `kern` table.
+]]
+local Fixture = {}
+
+--- Big-endian values packed by a `string.pack` format.
+local function packed(format: string, ...: number): string
+  return string.pack('>' .. format, ...)
+end
+
+--- A string as UTF-16, big-endian.
+local function wide(text: string): string
+  return (string.gsub(text, '.', function(character: string): string
+    return '\0' .. character
+  end))
+end
+
+--- Pads a table to a multiple of four bytes.
+local function aligned(data: string): string
+  return data .. string.rep('\0', (4 - #data % 4) % 4)
+end
+
+local function head(): string
+  return packed('I4I4I4I4I2I2', 0x00010000, 0x00010000, 0, 0x5F0F3CF5, 0, 1000)
+    .. string.rep('\0', 16)
+    .. packed('i2i2i2i2I2I2i2i2i2', 0, -200, 600, 800, 0, 8, 2, 0, 0)
+end
+
+local function horizontalHeader(): string
+  return packed('I4i2i2i2', 0x00010000, 800, -200, 100) .. string.rep('\0', 24) .. packed('I2', 4)
+end
+
+local function profile(): string
+  return packed('I4I2', 0x00005000, 4)
+end
+
+local function metrics(): string
+  return packed('I2i2I2i2I2i2I2i2', 0, 0, 600, 100, 600, 0, 400, 100)
+end
+
+local function os2(): string
+  return packed('I2', 2) .. string.rep('\0', 84) .. packed('i2i2', 500, 700) .. string.rep('\0', 6)
+end
+
+local function names(): string
+  local strings: { { id: number, text: string } } = {
+    { id = 1, text = 'Test Sans' },
+    { id = 2, text = 'Bold' },
+    { id = 4, text = 'Test Sans Bold' },
+    { id = 5, text = 'Version 1.000' },
+  }
+
+  local records, storage = {}, {}
+  local offset = 0
+
+  for _, entry in strings do
+    local text = wide(entry.text)
+
+    table.insert(records, packed('I2I2I2I2I2I2', 3, 1, 0x409, entry.id, #text, offset))
+    table.insert(storage, text)
+    offset += #text
+  end
+
+  return packed('I2I2I2', 0, #strings, 6 + #strings * 12) .. table.concat(records) .. table.concat(storage)
+end
+
+--- Format 4: A, B and C to glyphs 1, 2 and 3, then the closing segment.
+local function characters(): string
+  local subtable = packed('I2I2I2I2I2I2I2', 4, 32, 0, 4, 4, 1, 0)
+    .. packed('I2I2', 67, 0xFFFF)
+    .. packed('I2', 0)
+    .. packed('I2I2', 65, 0xFFFF)
+    .. packed('I2I2', (1 - 65) % 65536, 1)
+    .. packed('I2I2', 0, 0)
+
+  return packed('I2I2I2I2I4', 0, 1, 3, 1, 12) .. subtable
+end
+
+--- The glyphs, each padded to an even length, and `loca` in short offsets.
+local function glyphs(): (string, string)
+  local square = packed('i2i2i2i2i2', 1, 100, 0, 500, 700)
+    .. packed('I2I2', 3, 0)
+    -- One flag on the curve, repeated three more times.
+    .. packed('I1I1', 0x09, 3)
+    .. packed('i2i2i2i2', 100, 0, 400, 0)
+    .. packed('i2i2i2i2', 0, 700, 0, -700)
+  local diamond = packed('i2i2i2i2i2', 1, 0, 0, 600, 700)
+    .. packed('I2I2', 3, 0)
+    .. packed('I1I1I1I1', 0, 0, 0, 0)
+    .. packed('i2i2i2i2', 300, 300, -300, -300)
+    .. packed('i2i2i2i2', 0, 350, 350, -350)
+  -- Words, offsets, a scale; one component.
+  local composite = packed('i2i2i2i2i2', -1, 100, 0, 300, 350) .. packed('I2I2i2i2i2', 0x000B, 1, 50, 0, 8192)
+  local parts = { '', aligned(square), aligned(diamond), aligned(composite) }
+  local offsets, at = {}, 0
+
+  for _, part in parts do
+    table.insert(offsets, packed('I2', at // 2))
+    at += #part
+  end
+
+  table.insert(offsets, packed('I2', at // 2))
+
+  return table.concat(parts), table.concat(offsets)
+end
+
+--- GPOS with one script, one `kern` feature, and its two lookups.
+local function positioning(): string
+  local scripts = packed('I2', 1) .. 'latn' .. packed('I2', 8) .. packed('I2I2', 4, 0) .. packed('I2I2I2I2', 0, 0xFFFF, 1, 0)
+  local features = packed('I2', 1) .. 'kern' .. packed('I2', 8) .. packed('I2I2I2I2', 0, 2, 0, 1)
+  -- A then B: a pair set, with its coverage after it.
+  local pairSet = packed('I2I2I2I2I2I2', 1, 12, 4, 0, 1, 18)
+    .. packed('I2I2I2', 1, 1, 1)
+    .. packed('I2I2i2', 1, 2, -50)
+  local extension = packed('I2I2I4', 1, 2, 8) .. pairSet
+  local first = packed('I2I2I2I2', 9, 0, 1, 8) .. extension
+  -- B then A: classes, B in the first's class 1 and A in the second's.
+  local classes = packed('I2I2I2I2I2I2I2I2', 2, 24, 4, 0, 34, 42, 2, 2)
+    .. packed('i2i2i2i2', 0, 0, 0, -20)
+    .. packed('I2I2I2I2I2', 2, 1, 2, 2, 0)
+    .. packed('I2I2I2I2', 1, 2, 1, 1)
+    .. packed('I2I2I2I2I2', 2, 1, 1, 1, 1)
+  local second = packed('I2I2I2I2', 2, 0, 1, 8) .. classes
+  local lookups = packed('I2I2I2', 2, 6, 6 + #first) .. first .. second
+  local header = 10
+
+  return packed('I4I2I2I2', 0x00010000, header, header + #scripts, header + #scripts + #features)
+    .. scripts
+    .. features
+    .. lookups
+end
+
+--- A `kern` table of one format 0 subtable: A then C by -30.
+local function kerning(): string
+  local pairs = packed('I2I2i2', 1, 3, -30)
+  local subtable = packed('I2I2I2', 0, 14 + #pairs, 0x0001) .. packed('I2I2I2I2', 1, 6, 0, 0) .. pairs
+
+  return packed('I2I2', 0, 1) .. subtable
+end
+
+--- A font file of tables by tag, in tag order.
+local function assemble(tables: { [string]: string }): buffer
+  local tags: { string } = {}
+
+  for tag in tables do
+    table.insert(tags, tag)
+  end
+
+  table.sort(tags)
+
+  local directory = { packed('I4I2I2I2I2', 0x00010000, #tags, 0, 0, 0) }
+  local bodies: { string } = {}
+  local offset = 12 + #tags * 16
+
+  for _, tag in tags do
+    local body = aligned(tables[tag])
+
+    table.insert(directory, tag .. packed('I4I4I4', 0, offset, #tables[tag]))
+    table.insert(bodies, body)
+    offset += #body
+  end
+
+  return buffer.fromstring(table.concat(directory) .. table.concat(bodies))
+end
+
+--- The tables both fonts share.
+local function common(): { [string]: string }
+  local outlines, locations = glyphs()
+
+  return {
+    head = head(),
+    hhea = horizontalHeader(),
+    maxp = profile(),
+    hmtx = metrics(),
+    ['OS/2'] = os2(),
+    name = names(),
+    cmap = characters(),
+    glyf = outlines,
+    loca = locations,
+  }
+end
+
+--- The font that kerns through GPOS.
+function Fixture.kerned(): buffer
+  local tables = common()
+
+  tables.GPOS = positioning()
+
+  return assemble(tables)
+end
+
+--- The font that kerns through a `kern` table.
+function Fixture.legacy(): buffer
+  local tables = common()
+
+  tables.kern = kerning()
+
+  return assemble(tables)
+end
+
+--- A font file missing one of its tables.
+function Fixture.without(tag: string): buffer
+  local tables = common()
+
+  tables[tag] = nil
+
+  return assemble(tables)
+end
+
+return Fixture
