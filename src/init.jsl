@@ -7,11 +7,18 @@
   Font:missing(text) -> { string }     the characters of a text the font has no glyph for
   Font:measure(text, size, options)    the advance and ink box of a run of text
   Font:outline(pen, text, size, x, y, options) -> Metrics
+  Font:vary(coordinates) -> Font       a variable font at a position on its axes, by axis tag
 
 Sizes are pixels per em; a run starts at its origin on the baseline and runs right, y down. Text
 is UTF-8, one glyph a character, kerned by the font's GPOS pair adjustments (the `kern` feature
 of its Latin or default script) or else by a `kern` table. There is no hinting, no glyph
 substitution (no ligatures, no shaping of complex scripts), and no CFF outlines.
+
+A variable font lists its axes (`font.axes`) and named instances (`font.instances`) from `fvar`,
+and loads at its default position. `vary` gives the font at another: user coordinates normalized
+through `avar`, outlines moved by `gvar`'s deltas (inferring the points a region leaves out), and
+advances moved by `gvar`'s phantom points, so a run's metrics and its outlines agree. Kerning and
+the vertical metrics stay the default instance's: GPOS device deltas, HVAR and MVAR are not read.
 
 Outlines go to a pen, a table of four functions, so the package draws with nothing of its own:
 whatever fills shapes (a rasterizer, an SVG writer, a hit test) hands it one.
@@ -23,8 +30,24 @@ local Font = {}
 Font.__index = Font
 
 --- A glyph's outline in font units, y up: each contour's points as x, y, and 1 when the point is
---- on the curve or 0 when it is a control point, in one flat list.
-type Outline = { contours: { { number } }, left: number, bottom: number, right: number, top: number }
+--- on the curve or 0 when it is a control point, in one flat list; its ink box; how far it moves
+--- the pen; and where its origin falls on x, 0 unless a variation moved its left side bearing.
+type Outline = {
+  contours: { { number } },
+  left: number,
+  bottom: number,
+  right: number,
+  top: number,
+  advance: number,
+  origin: number,
+}
+
+--- A variable font's axis, in its user scale (`wght` from 100 to 900, say), and its name. A
+--- hidden axis is meant for programs rather than for people choosing a style.
+export type Axis = { tag: string, name: string, minimum: number, default: number, maximum: number, hidden: boolean }
+
+--- A style a variable font names (`Bold`), and its position, in user coordinates by axis tag.
+export type Instance = { name: string, coordinates: { [string]: number } }
 
 --- A GPOS pair adjustment subtable, as offsets into the font.
 type PairTable = { at: number, format: number, coverage: number, firstFormat: number, secondFormat: number }
@@ -56,6 +79,21 @@ type Fields = {
   glyphs: { [number]: number },
   outlines: { [number]: Outline },
   kerns: { [number]: number },
+  --- The `fvar` axes and named instances, both empty for a font that doesn't vary.
+  axes: { Axis },
+  instances: { Instance },
+  --- Where the font is on its axes, in user coordinates by tag.
+  position: { [string]: number },
+  --- The same position normalized, in 2.14 units (16384 is +1), in axis order.
+  normalized: { number },
+  --- Whether the position is any but the default, where the outlines are `glyf`'s own.
+  varied: boolean,
+  --- `avar`'s segment map for each axis: from and to pairs in 2.14 units, empty for an axis it
+  --- leaves alone.
+  segmentMaps: { { number } },
+  --- Every position the font has been varied to, by its normalized coordinates; one table, shared
+  --- by the font and all its variations.
+  variants: { [string]: Fields },
 }
 
 --- A TrueType font: its names and vertical metrics in font units, and what it is read from.
@@ -366,6 +404,139 @@ local function kernTable(data: buffer, at: number?): { [number]: number }
   return pairs
 end
 
+--- A 16.16 fixed-point number.
+local function fixed(data: buffer, at: number): number
+  return bytes.readi32be(data, at) / 65536
+end
+
+--- An `fvar` table's axes and named instances, their names from the font's `name` table.
+local function variations(data: buffer, at: number?, found: { [number]: string }): ({ Axis }, { Instance })
+  local axes: { Axis }, instances: { Instance } = {}, {}
+
+  if not at then return axes, instances end
+
+  local axisSize, instanceSize = u16(data, at + 10), u16(data, at + 14)
+  local record = at + u16(data, at + 4)
+
+  for _ = 1, u16(data, at + 8) do
+    local tag = buffer.readstring(data, record, 4)
+
+    table.insert(axes, {
+      tag = tag,
+      name = found[u16(data, record + 18)] or tag,
+      minimum = fixed(data, record + 4),
+      default = fixed(data, record + 8),
+      maximum = fixed(data, record + 12),
+      hidden = bit32.btest(u16(data, record + 16), 1),
+    })
+
+    record += axisSize
+  end
+
+  -- The instances follow the axes; each may end in a PostScript name ID, which instanceSize says.
+  for _ = 1, u16(data, at + 12) do
+    local coordinates: { [string]: number } = {}
+
+    for index, axis in axes do
+      coordinates[axis.tag] = fixed(data, record + index * 4)
+    end
+
+    table.insert(instances, { name = found[u16(data, record)] or '', coordinates = coordinates })
+    record += instanceSize
+  end
+
+  return axes, instances
+end
+
+--- `avar`'s segment map for each of a number of axes, as from and to pairs in 2.14 units. A map
+--- without all of -1 to -1, 0 to 0 and +1 to +1 changes nothing, the spec says, so it is empty.
+local function segmentMaps(data: buffer, at: number?, axisCount: number): { { number } }
+  local maps = table.create(axisCount) :: { { number } }
+
+  for index = 1, axisCount do
+    maps[index] = {}
+  end
+
+  if not at then return maps end
+
+  local record = at + 8
+
+  for index = 1, math.min(axisCount, u16(data, at + 6)) do
+    local map: { number } = {}
+    local anchors = 0
+
+    for _ = 1, u16(data, record) do
+      local from, to = i16(data, record + 2), i16(data, record + 4)
+
+      if from == to and (from == -16384 or from == 0 or from == 16384) then anchors += 1 end
+
+      table.insert(map, from)
+      table.insert(map, to)
+      record += 4
+    end
+
+    record += 2
+
+    if anchors >= 3 then maps[index] = map end
+  end
+
+  return maps
+end
+
+--- A 16.16 fixed-point value of a number, rounded, between -1 and +1.
+local function unit(value: number): number
+  return math.clamp(math.floor(value * 65536 + 0.5), -65536, 65536)
+end
+
+--- An axis value in user coordinates normalized as the OpenType variations overview says: clamped
+--- to the axis, its minimum, default and maximum mapped to -1, 0 and +1 in 16.16, then through
+--- the axis's `avar` segments, then rounded to 2.14. The result is in 2.14 units.
+local function normalized(axis: Axis, value: number, map: { number }): number
+  local clamped = math.clamp(value, axis.minimum, axis.maximum)
+  local share = 0
+
+  if clamped < axis.default then
+    share = -(axis.default - clamped) / (axis.default - axis.minimum)
+  elseif clamped > axis.default then
+    share = (clamped - axis.default) / (axis.maximum - axis.default)
+  end
+
+  local position = unit(share)
+
+  -- The first segment whose end is at or past the value maps it; the map's first entry is -1.
+  for index = 3, #map - 1, 2 do
+    local from = map[index] * 4
+
+    if from < position then continue end
+
+    if from == position then
+      position = map[index + 1] * 4
+
+      break
+    end
+
+    local startFrom, startTo, endTo = map[index - 2] * 4, map[index - 1] * 4, map[index + 1] * 4
+
+    position = unit((startTo + (position - startFrom) / (from - startFrom) * (endTo - startTo)) / 65536)
+
+    break
+  end
+
+  -- 16.16 to 2.14: add 2, then shift right by 2, keeping the sign.
+  return (position + 2) // 4
+end
+
+--- The key a position is kept under: its normalized coordinates.
+local function positionKey(position: { number }): string
+  local parts = table.create(#position) :: { string }
+
+  for _, coordinate in position do
+    table.insert(parts, tostring(coordinate))
+  end
+
+  return table.concat(parts, ' ')
+end
+
 --- Reads a font from its bytes or from the file at a path.
 function Module.load(source: buffer | string): Font
   local data: buffer
@@ -411,6 +582,13 @@ function Module.load(source: buffer | string): Font
   local hasHeights = metrics and u16(data, metrics) >= 2
   local capHeight = if metrics and hasHeights then i16(data, metrics + 88) else math.floor(ascender * 0.7)
   local xHeight = if metrics and hasHeights then i16(data, metrics + 86) else math.floor(ascender * 0.5)
+  local axes, instances = variations(data, tables.fvar, found)
+  local position: { [string]: number } = {}
+
+  for _, axis in axes do
+    position[axis.tag] = axis.default
+  end
+
   local fields: Fields = {
     data = data,
     tables = tables,
@@ -434,9 +612,18 @@ function Module.load(source: buffer | string): Font
     glyphs = {},
     outlines = {},
     kerns = {},
+    axes = axes,
+    instances = instances,
+    position = position,
+    normalized = table.create(#axes, 0),
+    varied = false,
+    segmentMaps = segmentMaps(data, tables.avar, #axes),
+    variants = {},
   }
 
   if #fields.pairLookups == 0 then fields.kernPairs = kernTable(data, tables.kern) end
+
+  fields.variants[positionKey(fields.normalized)] = fields
 
   return setmetatable(fields, Font)
 end
@@ -524,12 +711,284 @@ function Font.missing(self: Font, text: string): { string }
   return lacking
 end
 
---- How far a glyph moves the pen, in font units.
-function Font.advance(self: Font, glyph: number): number
-  local metrics = self.tables.hmtx
+--- A glyph's advance in `hmtx`: the default instance's.
+local function metric(self: Font, glyph: number): number
   local index = math.min(glyph, self.metricCount - 1)
 
-  return u16(self.data, metrics + index * 4)
+  return u16(self.data, self.tables.hmtx + index * 4)
+end
+
+--- How far a glyph moves the pen, in font units: at a varied position, `hmtx`'s advance moved by
+--- the glyph's phantom points, which may leave a fraction.
+function Font.advance(self: Font, glyph: number): number
+  if self.varied then return self:outlineOf(glyph).advance end
+
+  return metric(self, glyph)
+end
+
+--- The font at a position on its variation axes, in user coordinates by axis tag:
+--- `font:vary { wght = 700 }`. An axis it doesn't name keeps this font's position, a value past an
+--- axis's range is clamped to it, and a tag the font has no axis for is an error. The result is a
+--- Font sharing this one's bytes, whose outlines, advances and ink boxes are the position's. Each
+--- position is kept with the outlines read at it, so varying to it again costs nothing; at every
+--- axis's default it is the font as loaded.
+function Font.vary(self: Font, coordinates: { [string]: number }): Font
+  local position = table.clone(self.position)
+
+  for tag, value in coordinates do
+    if not position[tag] then error(`truetype: font has no '{tag}' axis`, 2) end
+
+    position[tag] = value
+  end
+
+  local normal = table.create(#self.axes) :: { number }
+
+  for index, axis in self.axes do
+    position[axis.tag] = math.clamp(position[axis.tag], axis.minimum, axis.maximum)
+    normal[index] = normalized(axis, position[axis.tag], self.segmentMaps[index])
+  end
+
+  local key = positionKey(normal)
+  local known = self.variants[key]
+
+  if known then return setmetatable(known, Font) end
+
+  local variant = table.clone(self)
+
+  variant.position, variant.normalized, variant.varied = position, normal, true
+  variant.outlines = {}
+  self.variants[key] = variant
+
+  return variant
+end
+
+--- How much of a tuple variation applies at a position, as the OpenType variations overview's
+--- interpolation algorithm says: the product of each axis's share of the region, from its peak and
+--- its start and end, which a region that isn't intermediate takes from its peak and zero. All are
+--- in 2.14 units.
+local function scalar(data: buffer, position: { number }, peakAt: number, startAt: number?, endAt: number?): number
+  local total = 1
+
+  for index, coordinate in position do
+    local offset = (index - 1) * 2
+    local peak = i16(data, peakAt + offset)
+
+    if peak == 0 then continue end
+
+    local start = if startAt then i16(data, startAt + offset) else math.min(peak, 0)
+    local finish = if endAt then i16(data, endAt + offset) else math.max(peak, 0)
+
+    -- A region out of order, or one crossing zero, leaves the axis out.
+    if start > peak or peak > finish or (start < 0 and finish > 0) then continue end
+    if coordinate < start or coordinate > finish then return 0 end
+    if coordinate == peak then continue end
+
+    total *= if coordinate < peak then (coordinate - start) / (peak - start) else (finish - coordinate) / (finish - peak)
+  end
+
+  return total
+end
+
+--- Packed point numbers at `at`, and where they end: nil when they name every point.
+local function pointNumbers(data: buffer, at: number): ({ number }?, number)
+  local first = buffer.readu8(data, at)
+
+  if first == 0 then return nil, at + 1 end
+
+  local count = first
+
+  at += 1
+
+  if bit32.btest(first, 0x80) then
+    count = bit32.band(first, 0x7F) * 256 + buffer.readu8(data, at)
+    at += 1
+  end
+
+  local numbers = table.create(count) :: { number }
+  local point = 0
+
+  -- Each number is the difference from the one before, the first from zero.
+  while #numbers < count do
+    local control = buffer.readu8(data, at)
+    local words = bit32.btest(control, 0x80)
+
+    at += 1
+
+    for _ = 1, bit32.band(control, 0x7F) + 1 do
+      if words then
+        point += u16(data, at)
+        at += 2
+      else
+        point += buffer.readu8(data, at)
+        at += 1
+      end
+
+      table.insert(numbers, point)
+    end
+  end
+
+  return numbers, at
+end
+
+--- A number of packed deltas at `at`, and where they end.
+local function packedDeltas(data: buffer, at: number, count: number): ({ number }, number)
+  local values = table.create(count) :: { number }
+
+  while #values < count do
+    local control = buffer.readu8(data, at)
+    local run = bit32.band(control, 0x3F) + 1
+
+    at += 1
+
+    if bit32.btest(control, 0x80) then
+      for _ = 1, run do
+        table.insert(values, 0)
+      end
+    elseif bit32.btest(control, 0x40) then
+      for _ = 1, run do
+        table.insert(values, i16(data, at))
+        at += 2
+      end
+    else
+      for _ = 1, run do
+        table.insert(values, buffer.readi8(data, at))
+        at += 1
+      end
+    end
+  end
+
+  return values, at
+end
+
+--- The delta inferred for a point a region leaves out, in one direction, from the points it names
+--- on either side: 'gvar', "Inferred deltas for un-referenced point numbers".
+local function between(target: number, before: number, beforeDelta: number, after: number, afterDelta: number): number
+  if before == after then return if beforeDelta == afterDelta then beforeDelta else 0 end
+  if target <= math.min(before, after) then return if before < after then beforeDelta else afterDelta end
+  if target >= math.max(before, after) then return if before > after then beforeDelta else afterDelta end
+
+  return beforeDelta + (target - before) / (after - before) * (afterDelta - beforeDelta)
+end
+
+--- Infers, in one direction, the deltas of the points of each contour that a region names some of
+--- but not all, writing them into `deltas`. `coordinates` are the glyph's default points, `touched`
+--- says which points the region names, and `ends` is each contour's last point, from 0.
+local function infer(coordinates: { number }, deltas: { number }, touched: { boolean }, ends: { number })
+  for contour, last in ends do
+    local first, finish = if contour == 1 then 1 else ends[contour - 1] + 2, last + 1
+    local named: { number } = {}
+
+    for index = first, finish do
+      if touched[index] then table.insert(named, index) end
+    end
+
+    if #named == 0 or #named == finish - first + 1 then continue end
+
+    -- Between each named point and the next, around the contour: with one named point, the whole
+    -- contour lies between it and itself, and takes its delta.
+    for position, before in named do
+      local after = named[position % #named + 1]
+      local index = if before == finish then first else before + 1
+
+      while index ~= after do
+        deltas[index] = between(coordinates[index], coordinates[before], deltas[before], coordinates[after], deltas[after])
+        index = if index == finish then first else index + 1
+      end
+    end
+  end
+end
+
+--- The net amounts a varied font moves a glyph's points by, x and y: one each for its `count`
+--- points (a composite's components) and then its four phantom points. A simple glyph passes its
+--- default points and contour ends, so the points a region leaves out are inferred; a composite's
+--- components move only where a region names them.
+local function glyphDeltas(self: Font, glyph: number, count: number, xs: { number }?, ys: { number }?, ends: { number }?): ({ number }, { number })
+  local total = count + 4
+  local netX, netY = table.create(total, 0) :: { number }, table.create(total, 0) :: { number }
+  local data, variations = self.data, self.tables.gvar
+
+  if not variations or glyph >= u16(data, variations + 12) then return netX, netY end
+
+  local axisCount = u16(data, variations + 4)
+  local shared, array = variations + u32(data, variations + 8), variations + u32(data, variations + 16)
+  local start, finish = 0, 0
+
+  if bit32.btest(u16(data, variations + 14), 1) then
+    start, finish = u32(data, variations + 20 + glyph * 4), (u32(data, variations + 24 + glyph * 4))
+  else
+    start, finish = u16(data, variations + 20 + glyph * 2) * 2, u16(data, variations + 22 + glyph * 2) * 2
+  end
+
+  if finish <= start then return netX, netY end
+
+  local at = array + start
+  local counted = u16(data, at)
+  local header, cursor = at + 4, at + u16(data, at + 2)
+  local sharedPoints: { number }? = nil
+
+  if bit32.btest(counted, 0x8000) then sharedPoints, cursor = pointNumbers(data, cursor) end
+
+  for _ = 1, bit32.band(counted, 0x0FFF) do
+    local size, index = u16(data, header), u16(data, header + 2)
+    local embedded = bit32.btest(index, 0x8000)
+    local peak = if embedded then header + 4 else shared + bit32.band(index, 0x0FFF) * axisCount * 2
+    local regionStart: number?, regionEnd: number? = nil, nil
+    local tuple = cursor
+
+    header += if embedded then 4 + axisCount * 2 else 4
+
+    if bit32.btest(index, 0x4000) then
+      regionStart, regionEnd = header, header + axisCount * 2
+      header += axisCount * 4
+    end
+
+    cursor += size
+
+    local share = scalar(data, self.normalized, peak, regionStart, regionEnd)
+
+    if share == 0 then continue end
+
+    local points = sharedPoints
+
+    if bit32.btest(index, 0x2000) then points, tuple = pointNumbers(data, tuple) end
+
+    local named = if points then #points else total
+    local deltaX, after = packedDeltas(data, tuple, named)
+    local deltaY = packedDeltas(data, after, named)
+
+    if not points then
+      for point = 1, total do
+        netX[point] += share * deltaX[point]
+        netY[point] += share * deltaY[point]
+      end
+
+      continue
+    end
+
+    local tupleX, tupleY = table.create(total, 0) :: { number }, table.create(total, 0) :: { number }
+    local touched = table.create(total, false) :: { boolean }
+
+    -- A point may be named more than once; its deltas add up.
+    for position, point in points do
+      if point >= total then continue end
+
+      tupleX[point + 1] += deltaX[position]
+      tupleY[point + 1] += deltaY[position]
+      touched[point + 1] = true
+    end
+
+    if xs and ys and ends then
+      infer(xs, tupleX, touched, ends)
+      infer(ys, tupleY, touched, ends)
+    end
+
+    for point = 1, total do
+      netX[point] += share * tupleX[point]
+      netY[point] += share * tupleY[point]
+    end
+  end
+
+  return netX, netY
 end
 
 --- The adjustment to the space between two glyphs, in font units.
@@ -595,16 +1054,43 @@ function Font.kerning(self: Font, first: number, second: number): number
   return total
 end
 
---- Appends a composite glyph's components to an outline, each moved by its transform.
-local function components(self: Font, at: number, outline: Outline, depth: number)
+--- How many components a composite glyph's description at `at` (past its header) has.
+local function componentCount(data: buffer, at: number): number
+  local count, more = 0, true
+
+  while more do
+    local flags = u16(data, at)
+    local transform = if bit32.btest(flags, 0x8) then 2 elseif bit32.btest(flags, 0x40) then 4 elseif bit32.btest(flags, 0x80) then 8 else 0
+
+    at += 4 + (if bit32.btest(flags, 0x1) then 4 else 2) + transform
+    count += 1
+    more = bit32.btest(flags, 0x20)
+  end
+
+  return count
+end
+
+--- Appends a composite glyph's components to an outline, each moved by its transform. At a varied
+--- position, the glyph's deltas move each component's offset and its phantom points move its
+--- advance, unless a component lends it its metrics.
+local function components(self: Font, glyph: number, at: number, outline: Outline, depth: number)
   local data = self.data
+  local deltaX: { number }, deltaY: { number } = {}, {}
+  local count, index = 0, 0
   local more = true
+  local metrics: Outline? = nil
+
+  if self.varied then
+    count = componentCount(data, at)
+    deltaX, deltaY = glyphDeltas(self, glyph, count)
+  end
 
   while more do
     local flags, component = u16(data, at), u16(data, at + 2)
     local dx, dy = 0, 0
 
     at += 4
+    index += 1
 
     -- Arguments are words or bytes, and offsets or (unsupported here) points to match.
     if bit32.btest(flags, 0x1) then
@@ -616,6 +1102,9 @@ local function components(self: Font, at: number, outline: Outline, depth: numbe
 
       at += 2
     end
+
+    -- Deltas move offsets, never points to match.
+    if self.varied and bit32.btest(flags, 0x2) then dx, dy = dx + deltaX[index], dy + deltaY[index] end
 
     local xx, xy, yx, yy = 1, 0, 0, 1
 
@@ -631,26 +1120,41 @@ local function components(self: Font, at: number, outline: Outline, depth: numbe
       at += 8
     end
 
-    for _, contour in self:outlineOf(component, depth + 1).contours do
+    local part = self:outlineOf(component, depth + 1)
+
+    for _, contour in part.contours do
       local moved = table.create(#contour) :: { number }
 
-      for index = 1, #contour - 2, 3 do
-        local pointX, pointY = contour[index], contour[index + 1]
+      for point = 1, #contour - 2, 3 do
+        local pointX, pointY = contour[point], contour[point + 1]
 
         table.insert(moved, xx * pointX + yx * pointY + dx)
         table.insert(moved, xy * pointX + yy * pointY + dy)
-        table.insert(moved, contour[index + 2])
+        table.insert(moved, contour[point + 2])
       end
 
       table.insert(outline.contours, moved)
     end
 
+    if bit32.btest(flags, 0x200) then metrics = part end
+
     more = bit32.btest(flags, 0x20)
+  end
+
+  if not self.varied then return end
+
+  -- The last component that says to use its metrics overrides the composite's phantom points.
+  if metrics then
+    outline.advance, outline.origin = metrics.advance, metrics.origin
+  else
+    outline.advance += deltaX[count + 2] - deltaX[count + 1]
+    outline.origin = deltaX[count + 1]
   end
 end
 
---- A simple glyph's contours, from its description at `at` (past its header).
-local function contoursOf(data: buffer, at: number, count: number): { { number } }
+--- A simple glyph's points from its description at `at` (past its header): x and y, 1 on the curve
+--- and 0 off it, and each contour's last point, counted from 0.
+local function pointsOf(data: buffer, at: number, count: number): ({ number }, { number }, { number }, { number })
   local ends = table.create(count) :: { number }
 
   for index = 0, count - 1 do
@@ -713,7 +1217,18 @@ local function contoursOf(data: buffer, at: number, count: number): { { number }
     ys[index] = pointY
   end
 
-  local contours = table.create(count) :: { { number } }
+  local onCurve = table.create(points) :: { number }
+
+  for index = 1, points do
+    onCurve[index] = if bit32.btest(flags[index], 0x1) then 1 else 0
+  end
+
+  return xs, ys, onCurve, ends
+end
+
+--- A simple glyph's contours, from its points.
+local function contoursOf(xs: { number }, ys: { number }, onCurve: { number }, ends: { number }): { { number } }
+  local contours = table.create(#ends) :: { { number } }
   local first = 1
 
   for _, last in ends do
@@ -722,7 +1237,7 @@ local function contoursOf(data: buffer, at: number, count: number): { { number }
     for index = first, last + 1 do
       table.insert(contour, xs[index])
       table.insert(contour, ys[index])
-      table.insert(contour, if bit32.btest(flags[index], 0x1) then 1 else 0)
+      table.insert(contour, onCurve[index])
     end
 
     table.insert(contours, contour)
@@ -732,7 +1247,24 @@ local function contoursOf(data: buffer, at: number, count: number): { { number }
   return contours
 end
 
---- A glyph's outline in font units, read once and kept.
+--- Sets an outline's ink box to the box around its points, control points included, as `glyf`'s
+--- own boxes are; a varied glyph's header box is the default instance's.
+local function bound(outline: Outline)
+  local left, bottom, right, top = math.huge, math.huge, -math.huge, -math.huge
+
+  for _, contour in outline.contours do
+    for index = 1, #contour - 2, 3 do
+      left, right = math.min(left, contour[index]), (math.max(right, contour[index]))
+      bottom, top = math.min(bottom, contour[index + 1]), (math.max(top, contour[index + 1]))
+    end
+  end
+
+  if left > right then return end
+
+  outline.left, outline.bottom, outline.right, outline.top = left, bottom, right, top
+end
+
+--- A glyph's outline in font units, read once for each position and kept.
 function Font.outlineOf(self: Font, glyph: number, depth: number?): Outline
   local known = self.outlines[glyph]
 
@@ -750,20 +1282,43 @@ function Font.outlineOf(self: Font, glyph: number, depth: number?): Outline
     start, finish = u16(data, locations + glyph * 2) * 2, (u16(data, locations + glyph * 2 + 2) * 2)
   end
 
-  local outline: Outline = { contours = {}, left = 0, bottom = 0, right = 0, top = 0 }
+  local outline: Outline = { contours = {}, left = 0, bottom = 0, right = 0, top = 0, advance = metric(self, glyph), origin = 0 }
+  local at = glyphs + start
+  local count = if finish > start then i16(data, at) else 0
 
   if finish > start then
-    local at = glyphs + start
-    local count = i16(data, at)
-
     outline.left, outline.bottom, outline.right, outline.top = i16(data, at + 2), i16(data, at + 4), i16(data, at + 6), i16(data, at + 8)
-
-    if count > 0 then
-      outline.contours = contoursOf(data, at + 10, count)
-    elseif count < 0 then
-      components(self, at + 10, outline, depth or 0)
-    end
   end
+
+  if count > 0 then
+    local xs, ys, onCurve, ends = pointsOf(data, at + 10, count)
+
+    if self.varied then
+      local points = #xs
+      local deltaX, deltaY = glyphDeltas(self, glyph, points, xs, ys, ends)
+      local movedX, movedY = table.create(points) :: { number }, table.create(points) :: { number }
+
+      for index = 1, points do
+        movedX[index], movedY[index] = xs[index] + deltaX[index], ys[index] + deltaY[index]
+      end
+
+      outline.advance += deltaX[points + 2] - deltaX[points + 1]
+      outline.origin = deltaX[points + 1]
+      xs, ys = movedX, movedY
+    end
+
+    outline.contours = contoursOf(xs, ys, onCurve, ends)
+  elseif count < 0 then
+    components(self, glyph, at + 10, outline, depth or 0)
+  elseif self.varied and glyph < self.glyphCount then
+    -- No outline, but phantom points still to move.
+    local deltaX = glyphDeltas(self, glyph, 0)
+
+    outline.advance += deltaX[2] - deltaX[1]
+    outline.origin = deltaX[1]
+  end
+
+  if self.varied then bound(outline) end
 
   self.outlines[glyph] = outline
 
@@ -808,7 +1363,9 @@ function Font.measure(self: Font, text: string, size: number, options: Options?)
 
     if #outline.contours == 0 then continue end
 
-    left, right = math.min(left, offsets[index] + outline.left), (math.max(right, offsets[index] + outline.right))
+    local offset = offsets[index] - outline.origin
+
+    left, right = math.min(left, offset + outline.left), (math.max(right, offset + outline.right))
     top, bottom = math.min(top, -outline.top), (math.max(bottom, -outline.bottom))
   end
 
@@ -891,9 +1448,10 @@ function Font.outline(self: Font, pen: Pen, text: string, size: number, originX:
   local glyphs, offsets = placed(self, text, size, options)
 
   for index, glyph in glyphs do
-    local glyphX = originX + offsets[index] * scale
+    local outline = self:outlineOf(glyph)
+    local glyphX = originX + (offsets[index] - outline.origin) * scale
 
-    for _, contour in self:outlineOf(glyph).contours do
+    for _, contour in outline.contours do
       trace(pen, contour, scale, glyphX, originY)
     end
   end
