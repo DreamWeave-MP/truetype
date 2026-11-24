@@ -19,7 +19,7 @@ A [Jess](https://github.com/DreamWeave-MP/jess) package, `org.dreamweave.truetyp
 
 ```toml
 [dependencies]
-"org.dreamweave.truetype" = "0.1"
+"org.dreamweave.truetype" = "0.2"
 ```
 
 It reads a font and lays out a run of text; it draws nothing itself. A glyph's outline goes to a

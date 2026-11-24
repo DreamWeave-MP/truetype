@@ -18,3 +18,8 @@ jess = "org.dreamweave.truetype"
 version = "0.1.0"
 date = 2026-10-21
 summary = "First release: TrueType fonts read in JSL, names, metrics, character maps, kerning and outlines handed to a pen."
+
+[[releases]]
+version = "0.2.0"
+date = 2026-11-24
+summary = "Variable fonts with TrueType outlines: fvar's axes and named instances, avar, and gvar's deltas moving outlines, composites and advances, through Font:vary."
