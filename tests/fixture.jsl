@@ -9,7 +9,9 @@ control point, 600 wide; and `C`, a composite of `A` at half size moved 50 right
 
 `kerned` kerns through GPOS: A then B by -50 in a pair set (format 1) behind an extension
 lookup, and B then A by -20 through classes (format 2). `legacy` has no GPOS and kerns A then C by
--30 in a `kern` table.
+-30 in a `kern` table. `variable` is `kerned` with a weight axis and glyph variations, in which
+every kind of tuple the real fixture fonts don't use (embedded and intermediate peaks, shared
+point numbers, a moving origin) is used.
 ]]
 local Fixture = {}
 
@@ -52,13 +54,18 @@ local function os2(): string
   return packed('I2', 2) .. string.rep('\0', 84) .. packed('i2i2', 500, 700) .. string.rep('\0', 6)
 end
 
-local function names(): string
+--- The names, and any more a font has (its axes' and instances').
+local function names(more: { { id: number, text: string } }?): string
   local strings: { { id: number, text: string } } = {
     { id = 1, text = 'Test Sans' },
     { id = 2, text = 'Bold' },
     { id = 4, text = 'Test Sans Bold' },
     { id = 5, text = 'Version 1.000' },
   }
+
+  for _, entry in more or {} do
+    table.insert(strings, entry)
+  end
 
   local records, storage = {}, {}
   local offset = 0
@@ -204,6 +211,70 @@ function Fixture.legacy(): buffer
   local tables = common()
 
   tables.kern = kerning()
+
+  return assemble(tables)
+end
+
+--- `fvar`: one axis, `wght` from 100 through 400 to 900, named Weight, and two named instances,
+--- Light at 300 and Black at 900.
+local function axes(): string
+  local axis = 'wght' .. packed('i4i4i4I2I2', 100 * 65536, 400 * 65536, 900 * 65536, 0, 256)
+  local instances = packed('I2I2i4', 257, 0, 300 * 65536) .. packed('I2I2i4', 258, 0, 900 * 65536)
+
+  return packed('I2I2I2I2I2I2I2I2', 1, 0, 16, 2, 1, 20, 2, 8) .. axis .. instances
+end
+
+--- `gvar`, its one shared tuple the axis's maximum.
+---
+--- `A` has two regions. At the maximum (an embedded peak) one point moves by (100, 50) and, as the
+--- only point its contour names, takes the whole square with it. At -0.5 (an intermediate region
+--- from -1 to 0, every point named) its advance point moves -100.
+---
+--- `C` names its component and its left side bearing point, in shared point numbers, for the shared
+--- tuple: the component's offset moves 20 right and the side bearing point 10, which moves the
+--- glyph's origin and takes 10 off its advance.
+local function glyphVariations(): string
+  local square = packed('I2I2', 2, 20)
+    -- Embedded peak, private points.
+    .. packed('I2I2i2', 7, 0xA000, 16384)
+    -- Embedded peak, an intermediate region, private points (all of them).
+    .. packed('I2I2i2i2i2', 7, 0xE000, -8192, -16384, 0)
+    -- Point 2, then x and y deltas.
+    .. packed('I1I1I1', 1, 0, 2)
+    .. packed('I1i1', 0, 100)
+    .. packed('I1i1', 0, 50)
+    -- Every point: five x deltas of zero, -100 as a word, two zeros; eight y deltas of zero.
+    .. packed('I1', 0)
+    .. packed('I1I1i2I1', 0x84, 0x40, -100, 0x81)
+    .. packed('I1', 0x87)
+  local composite = packed('I2I2', 0x8001, 8)
+    .. packed('I2I2', 4, 0)
+    -- Shared points 0 and 1, then the tuple's deltas.
+    .. packed('I1I1I1I1', 2, 1, 0, 1)
+    .. packed('I1i1i1', 1, 20, 10)
+    .. packed('I1', 0x81)
+  local offsets = packed('I2I2I2I2I2', 0, 0, #square // 2, #square // 2, (#square + #composite) // 2)
+  local header = 20 + #offsets
+
+  return packed('I2I2I2I2I4I2I2I4', 1, 0, 1, 1, header, 4, 0, header + 2)
+    .. offsets
+    .. packed('i2', 16384)
+    .. square
+    .. composite
+end
+
+--- The font that varies: the kerned font with a weight axis.
+function Fixture.variable(): buffer
+  local tables = common()
+
+  tables.GPOS = positioning()
+  tables.fvar = axes()
+  tables.gvar = glyphVariations()
+  tables.name = names {
+    { id = 256, text = 'Weight' },
+    { id = 257, text = 'Light' },
+    { id = 258, text = 'Black' },
+  }
 
   return assemble(tables)
 end

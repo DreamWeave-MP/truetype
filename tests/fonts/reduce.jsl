@@ -1,0 +1,204 @@
+--!strict
+--[[
+Makes a small copy of a TrueType font for the suite: the glyphs a few characters map to (and the
+components of any composite among them) keep their outlines and their `gvar` data; every other
+glyph is left empty, keeping its number, its advance and its character map entry. Of the tables,
+only those `@truetype` reads are kept: no layout, no hinting, no `post` names.
+
+  jess run --trusted tests/fonts/reduce.jsl <font.ttf> <out.ttf> <characters>
+
+The fonts in noto-sans-cherokee/ were made by it from the Google Fonts download of Noto Sans
+Cherokee, with the characters `Ꭰ Ꭵ ꭲ Á . …` and a space.
+]]
+local bytes = require '@dream/bytes'
+local fs = require '@dream/fs'
+local truetype = require '@truetype'
+
+local Kept = { 'OS/2', 'avar', 'cmap', 'fvar', 'glyf', 'gvar', 'head', 'hhea', 'hmtx', 'loca', 'maxp', 'name' }
+
+local source, target, characters = ...
+
+if type(source) ~= 'string' or type(target) ~= 'string' or type(characters) ~= 'string' then
+  error('usage: reduce.jsl <font.ttf> <out.ttf> <characters>', 0)
+end
+
+local data = fs.readFile(source) or error(`can't read {source}`, 0)
+local font = truetype.load(data)
+
+local function u16(at: number): number
+  return bytes.readu16be(data, at)
+end
+
+local function u32(at: number): number
+  return bytes.readu32be(data, at)
+end
+
+local tables: { [string]: { at: number, length: number } } = {}
+
+for index = 0, u16(4) - 1 do
+  local record = 12 + index * 16
+
+  tables[buffer.readstring(data, record, 4)] = { at = u32(record + 8), length = u32(record + 12) }
+end
+
+--- Where a glyph's description starts and ends in `glyf`.
+local function located(glyph: number): (number, number)
+  local locations = tables.loca.at
+
+  if font.longOffsets then return u32(locations + glyph * 4), u32(locations + glyph * 4 + 4) end
+
+  return u16(locations + glyph * 2) * 2, u16(locations + glyph * 2 + 2) * 2
+end
+
+local keep: { [number]: boolean } = { [0] = true }
+
+--- Keeps a glyph and, for a composite, its components.
+local function keepGlyph(glyph: number)
+  keep[glyph] = true
+
+  local start, finish = located(glyph)
+  local at = tables.glyf.at + start
+
+  if finish <= start or bytes.readi16be(data, at) >= 0 then return end
+
+  at += 10
+
+  while true do
+    local flags = u16(at)
+    local transform = if bit32.btest(flags, 0x8) then 2 elseif bit32.btest(flags, 0x40) then 4 elseif bit32.btest(flags, 0x80) then 8 else 0
+
+    keepGlyph(u16(at + 2))
+    at += 4 + (if bit32.btest(flags, 0x1) then 4 else 2) + transform
+
+    if not bit32.btest(flags, 0x20) then break end
+  end
+end
+
+for _, codepoint in utf8.codes(characters) do
+  keepGlyph(font:glyph(codepoint))
+end
+
+local function packed(format: string, ...: number): string
+  return string.pack('>' .. format, ...)
+end
+
+local function slice(at: number, length: number): string
+  return buffer.readstring(data, at, length)
+end
+
+local bodies: { [string]: string } = {}
+
+for _, tag in Kept do
+  local found = tables[tag]
+
+  if found then bodies[tag] = slice(found.at, found.length) end
+end
+
+-- `glyf` and `loca`, in long offsets.
+local outlines, offsets = {}, {}
+local written = 0
+
+for glyph = 0, font.glyphCount - 1 do
+  table.insert(offsets, packed('I4', written))
+
+  if not keep[glyph] then continue end
+
+  local start, finish = located(glyph)
+  local description = slice(tables.glyf.at + start, finish - start)
+
+  description ..= string.rep('\0', (4 - #description % 4) % 4)
+  table.insert(outlines, description)
+  written += #description
+end
+
+table.insert(offsets, packed('I4', written))
+bodies.glyf, bodies.loca = table.concat(outlines), table.concat(offsets)
+
+-- indexToLocFormat 1, long offsets, and the checksum adjustment to be set once the file is whole.
+bodies.head = string.sub(bodies.head, 1, 8) .. packed('I4', 0) .. string.sub(bodies.head, 13, 50) .. packed('i2', 1) .. string.sub(bodies.head, 53)
+
+if tables.gvar then
+  local at = tables.gvar.at
+  local axisCount, sharedCount = u16(at + 4), u16(at + 6)
+  local long = bit32.btest(u16(at + 14), 1)
+  local array = at + u32(at + 16)
+  local shared = slice(at + u32(at + 8), sharedCount * axisCount * 2)
+  local variations, starts = {}, {}
+  local length = 0
+
+  for glyph = 0, font.glyphCount - 1 do
+    table.insert(starts, packed('I4', length))
+
+    if not keep[glyph] then continue end
+
+    local start = if long then u32(at + 20 + glyph * 4) else u16(at + 20 + glyph * 2) * 2
+    local finish = if long then u32(at + 24 + glyph * 4) else u16(at + 22 + glyph * 2) * 2
+    local variation = slice(array + start, finish - start)
+
+    variation ..= string.rep('\0', #variation % 2)
+    table.insert(variations, variation)
+    length += #variation
+  end
+
+  table.insert(starts, packed('I4', length))
+
+  local sharedAt = 20 + (font.glyphCount + 1) * 4
+
+  bodies.gvar = packed('I2I2I2I2I4I2I2I4', 1, 0, axisCount, sharedCount, sharedAt, font.glyphCount, 1, sharedAt + #shared)
+    .. table.concat(starts)
+    .. shared
+    .. table.concat(variations)
+end
+
+--- A table's checksum: its big-endian words, summed.
+local function checksum(body: string): number
+  local padded = body .. string.rep('\0', (4 - #body % 4) % 4)
+  local total = 0
+
+  for index = 1, #padded, 4 do
+    total = (total + (string.unpack('>I4', padded, index) :: number)) % 0x100000000
+  end
+
+  return total
+end
+
+local tags: { string } = {}
+
+for tag in bodies do
+  table.insert(tags, tag)
+end
+
+table.sort(tags)
+
+local power = 1
+
+while power * 2 <= #tags do
+  power *= 2
+end
+
+local directory = { packed('I4I2I2I2I2', 0x00010000, #tags, power * 16, math.log(power, 2), (#tags - power) * 16) }
+local stored: { string } = {}
+local offset, headAt = 12 + #tags * 16, 0
+
+for _, tag in tags do
+  local body = bodies[tag]
+
+  if tag == 'head' then headAt = offset end
+
+  table.insert(directory, tag .. packed('I4I4I4', checksum(body), offset, #body))
+  body ..= string.rep('\0', (4 - #body % 4) % 4)
+  table.insert(stored, body)
+  offset += #body
+end
+
+local file = table.concat(directory) .. table.concat(stored)
+local adjustment = (0xB1B0AFBA - checksum(file)) % 0x100000000
+
+-- The whole file's checksum, kept in `head`, 8 bytes in.
+file = string.sub(file, 1, headAt + 8) .. packed('I4', adjustment) .. string.sub(file, headAt + 13)
+
+local wrote, problem = fs.writeFile(target, file)
+
+if not wrote then error(`can't write {target}: {problem}`, 0) end
+
+print(`{target}: {#file} bytes, {#tags} tables`)

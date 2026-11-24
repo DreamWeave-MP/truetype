@@ -1,0 +1,293 @@
+--!strict
+-- `@truetype`'s variable fonts: axes and named instances, normalization through `avar`, and
+-- outlines and advances moved by `gvar`, over the suite's own variable font (./fixture) and over
+-- Noto Sans Cherokee (./fonts/noto-sans-cherokee), whose variable font is compared with the static
+-- instances its family ships at the same weights.
+local fixture = require './fixture'
+local fs = require '@dream/fs'
+local test = require '@jess/test'
+local truetype = require '@truetype'
+
+local expect = test.expect
+local suite = test.new()
+
+--- The static instances beside the variable font, by the weight each is.
+local Statics: { [string]: number } = { Thin = 100, Regular = 400, Bold = 700, Black = 900 }
+
+--- Characters the reduced fonts keep: simple glyphs with deltas for every point and with deltas
+--- for some (whose other points are inferred), and composites (`Á`, `…`).
+local Characters = 'ᎠᎥꭲÁ.… '
+
+--- How far a varied number may be from a static instance's: the statics are rounded to whole
+--- units.
+local Rounding = 0.5
+
+--- How far a varied point may be from a static instance's: a composite's component outline and
+--- its offset are each rounded in the static font.
+local PointRounding = 1
+
+--- The folder this file is in, from its chunk name.
+local function here(): string
+  local source = debug.info(1, 's')
+  local first = string.sub(source, 1, 1)
+  local path = if first == '@' or first == '=' then string.sub(source, 2) else source
+
+  return string.match(path, '^(.*)/[^/]*$') or '.'
+end
+
+local function cherokee(style: string): truetype.Font
+  local path = fs.join(here(), 'fonts', 'noto-sans-cherokee', `NotoSansCherokee-{style}.ttf`)
+  local data, problem = fs.readFile(path)
+  if not data then error(`{path}: {problem}`, 0) end
+
+  return truetype.load(data)
+end
+
+--- A pen that writes down what it is told, one command a line, numbers rounded to hundredths.
+local function recorder(): (truetype.Pen, { string })
+  local commands: { string } = {}
+
+  local function number(value: number): string
+    local rounded = math.floor(value * 100 + 0.5) / 100
+
+    return if rounded == math.floor(rounded) then string.format('%d', rounded) else tostring(rounded)
+  end
+
+  local pen: truetype.Pen = {
+    moveTo = function(toX: number, toY: number)
+      table.insert(commands, `M {number(toX)} {number(toY)}`)
+    end,
+    lineTo = function(toX: number, toY: number)
+      table.insert(commands, `L {number(toX)} {number(toY)}`)
+    end,
+    quadTo = function(controlX: number, controlY: number, toX: number, toY: number)
+      table.insert(commands, `Q {number(controlX)} {number(controlY)} {number(toX)} {number(toY)}`)
+    end,
+    close = function()
+      table.insert(commands, 'Z')
+    end,
+  }
+
+  return pen, commands
+end
+
+--- The largest difference between two glyphs' points, each about its origin, or infinity when
+--- their contours don't match in shape.
+local function farthest(static: truetype.Font, varied: truetype.Font, glyph: number): number
+  local expected, actual = static:outlineOf(glyph), varied:outlineOf(glyph)
+  local worst = 0
+
+  if #expected.contours ~= #actual.contours then return math.huge end
+
+  for contour, points in expected.contours do
+    local moved = actual.contours[contour]
+
+    if #points ~= #moved then return math.huge end
+
+    for index = 1, #points - 2, 3 do
+      local apartX = math.abs(points[index] - (moved[index] - actual.origin))
+      local apartY = math.abs(points[index + 1] - moved[index + 1])
+
+      if points[index + 2] ~= moved[index + 2] then return math.huge end
+
+      worst = math.max(worst, apartX, apartY)
+    end
+  end
+
+  return worst
+end
+
+suite.describe('axes', function()
+  suite.it('reads the axes and the named instances', function()
+    local font = truetype.load(fixture.variable())
+
+    expect(font.axes).toEqual {
+      { tag = 'wght', name = 'Weight', minimum = 100, default = 400, maximum = 900, hidden = false },
+    }
+
+    expect(font.instances).toEqual {
+      { name = 'Light', coordinates = { wght = 300 } },
+      { name = 'Black', coordinates = { wght = 900 } },
+    }
+
+    expect(font.position).toEqual { wght = 400 }
+  end)
+
+  suite.it('reads a real font\'s weight axis and its nine named instances', function()
+    local font = cherokee 'Variable'
+    local names: { string } = {}
+
+    expect(font.axes).toEqual {
+      { tag = 'wght', name = 'Weight', minimum = 100, default = 400, maximum = 900, hidden = false },
+    }
+
+    for _, instance in font.instances do
+      table.insert(names, `{instance.name} {instance.coordinates.wght}`)
+    end
+
+    expect(names).toEqual {
+      'Thin 100',
+      'ExtraLight 200',
+      'Light 300',
+      'Regular 400',
+      'Medium 500',
+      'SemiBold 600',
+      'Bold 700',
+      'ExtraBold 800',
+      'Black 900',
+    }
+  end)
+
+  suite.it('gives a font without fvar no axes, and only its own position', function()
+    local font = truetype.load(fixture.kerned())
+
+    expect(font.axes).toEqual {}
+    expect(font.instances).toEqual {}
+    expect(rawequal(font:vary {}, font)).toBe(true)
+
+    expect(function()
+      font:vary { wght = 700 }
+    end).toThrow "font has no 'wght' axis"
+  end)
+end)
+
+suite.describe('vary', function()
+  suite.it('normalizes without avar from the minimum, default and maximum', function()
+    local font = truetype.load(fixture.variable())
+
+    expect(font:vary({ wght = 650 }).normalized).toEqual { 8192 }
+    expect(font:vary({ wght = 250 }).normalized).toEqual { -8192 }
+    expect(font:vary({ wght = 900 }).normalized).toEqual { 16384 }
+  end)
+
+  suite.it("normalizes through the font's avar", function()
+    local font = cherokee 'Variable'
+
+    -- Its map takes 0.6 (Bold) to between 0.6 to 0.61 and 0.8 to 0.79, and -1/3 (Light) to -0.5,
+    -- where the default mapping alone would give 9831 and -5461.
+    expect(font:vary({ wght = 700 }).normalized).toEqual { 9995 }
+    expect(font:vary({ wght = 300 }).normalized).toEqual { -8192 }
+    expect(font:vary({ wght = 100 }).normalized).toEqual { -16384 }
+  end)
+
+  suite.it('is the font itself at the default, and keeps every other position', function()
+    local font = truetype.load(fixture.variable())
+    local bold = font:vary { wght = 700 }
+
+    expect(rawequal(font:vary { wght = 400 }, font)).toBe(true)
+    expect(rawequal(font:vary {}, font)).toBe(true)
+    expect(rawequal(bold:vary { wght = 400 }, font)).toBe(true)
+    expect(rawequal(font:vary { wght = 700 }, bold)).toBe(true)
+    expect(rawequal(bold:vary {}, bold)).toBe(true)
+    expect(bold.position).toEqual { wght = 700 }
+    expect(font.position).toEqual { wght = 400 }
+  end)
+
+  suite.it('clamps a value past the axis', function()
+    local font = truetype.load(fixture.variable())
+    local heaviest = font:vary { wght = 2000 }
+
+    expect(rawequal(heaviest, font:vary { wght = 900 })).toBe(true)
+    expect(heaviest.position).toEqual { wght = 900 }
+    expect(font:vary({ wght = -5 }).position).toEqual { wght = 100 }
+  end)
+
+  suite.it('refuses an axis the font lacks', function()
+    local font = truetype.load(fixture.variable())
+
+    expect(function()
+      font:vary { wdth = 75 }
+    end).toThrow "font has no 'wdth' axis"
+  end)
+end)
+
+suite.describe('glyph variations', function()
+  suite.it('draws the default outline at the default position', function()
+    local plain, plainCommands = recorder()
+    local varied, variedCommands = recorder()
+    local font = truetype.load(fixture.variable())
+
+    truetype.load(fixture.kerned()):outline(plain, 'ABC', 1000, 0, 1000)
+    font:vary({ wght = 400 }):outline(varied, 'ABC', 1000, 0, 1000)
+
+    expect(variedCommands).toEqual(plainCommands)
+  end)
+
+  suite.it('moves the points a region leaves out with the one it names', function()
+    local font = truetype.load(fixture.variable())
+    local full, fullCommands = recorder()
+    local half, halfCommands = recorder()
+
+    font:vary({ wght = 900 }):outline(full, 'A', 1000, 0, 1000)
+    font:vary({ wght = 650 }):outline(half, 'A', 1000, 0, 1000)
+
+    expect(fullCommands).toEqual { 'M 200 950', 'L 200 250', 'L 600 250', 'L 600 950', 'Z' }
+    expect(halfCommands).toEqual { 'M 150 975', 'L 150 275', 'L 550 275', 'L 550 975', 'Z' }
+  end)
+
+  suite.it('scales an intermediate region on both sides of its peak', function()
+    local font = truetype.load(fixture.variable())
+    local advances: { number } = {}
+
+    for _, weight in { 100, 175, 250, 325, 400, 900 } do
+      table.insert(advances, font:vary({ wght = weight }):advance(1))
+    end
+
+    expect(advances).toEqual { 600, 550, 500, 550, 600, 600 }
+  end)
+
+  suite.it("moves a composite's component and its origin", function()
+    local font = truetype.load(fixture.variable()):vary { wght = 900 }
+    local pen, commands = recorder()
+    local metrics = font:outline(pen, 'C', 1000, 0, 1000)
+
+    -- Its component, A, is varied too (+100, +50), then halved, then moved 70 right; the origin
+    -- is 10 right, and the advance 10 shorter.
+    expect(commands).toEqual { 'M 160 975', 'L 160 625', 'L 360 625', 'L 360 975', 'Z' }
+    expect(font:advance(3)).toBe(390)
+    expect({ metrics.width, metrics.left, metrics.top, metrics.right, metrics.bottom }).toEqual { 390, 160, -375, 360, -25 }
+  end)
+
+  suite.it('keeps kerning and the vertical metrics the default instance has', function()
+    local font = truetype.load(fixture.variable()):vary { wght = 900 }
+
+    expect(font:kerning(1, 2)).toBe(-50)
+    expect(font:measure('AB', 1000).width).toBe(1150)
+    expect(font:measure('AB', 1000).ascent).toBe(800)
+  end)
+end)
+
+suite.describe('against static instances', function()
+  for style, weight in Statics do
+    suite.it(`matches {style}'s outlines and advances at wght {weight}`, function()
+      local static, varied = cherokee(style), cherokee('Variable'):vary { wght = weight }
+      local worstPoint, worstAdvance = 0, 0
+
+      for _, codepoint in utf8.codes(Characters) do
+        local glyph = varied:glyph(codepoint)
+
+        expect(static:glyph(codepoint)).toBe(glyph)
+
+        worstPoint = math.max(worstPoint, farthest(static, varied, glyph))
+        worstAdvance = math.max(worstAdvance, math.abs(static:advance(glyph) - varied:advance(glyph)))
+      end
+
+      expect(worstPoint <= PointRounding).toBe(true)
+      expect(worstAdvance <= Rounding).toBe(true)
+    end)
+
+    suite.it(`measures a run as {style} does at wght {weight}`, function()
+      local static, varied = cherokee(style), cherokee('Variable'):vary { wght = weight }
+      local expected, actual = static:measure(Characters, 1000), varied:measure(Characters, 1000)
+
+      -- Each glyph's advance is rounded on its own in the static font.
+      expect(math.abs(expected.width - actual.width) <= Rounding * (utf8.len(Characters) :: number)).toBe(true)
+      expect(math.abs(expected.left - actual.left) <= Rounding).toBe(true)
+      expect(math.abs(expected.right - actual.right) <= Rounding * (utf8.len(Characters) :: number)).toBe(true)
+      expect(math.abs(expected.top - actual.top) <= Rounding).toBe(true)
+      expect(math.abs(expected.bottom - actual.bottom) <= Rounding).toBe(true)
+    end)
+  end
+end)
+
+return suite
